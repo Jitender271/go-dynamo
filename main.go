@@ -1,208 +1,302 @@
 package main
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
-	"hash/fnv"
-	"math/rand"
+	"hash"
+	"math/big"
 	"sync"
 	"time"
 )
 
-// VectorClock for versioning
-type VectorClock struct {
-	clocks map[int]int
+// hashString calculates the SHA-1 hash of a given string and returns it as a hexadecimal string
+func hashString(s string) string {
+	h := sha1.New()
+	h.Write([]byte(s))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-func NewVectorClock() *VectorClock {
-	return &VectorClock{clocks: make(map[int]int)}
+// Data structure for storing key-value pairs
+type Data struct {
+	Value       string
+	VectorClock map[string]int
 }
 
-func (vc *VectorClock) Increment(nodeID int) {
-	vc.clocks[nodeID]++
+// Merkle Tree Node
+type MerkleTreeNode struct {
+	Hash  string
+	Left  *MerkleTreeNode
+	Right *MerkleTreeNode
 }
 
-func (vc *VectorClock) Merge(other *VectorClock) {
-	for node, counter := range other.clocks {
-		if counter > vc.clocks[node] {
-			vc.clocks[node] = counter
-		}
+// Merkle Tree structure
+type MerkleTree struct {
+	Root  *MerkleTreeNode
+	Data  map[string]string
+	mutex sync.Mutex
+}
+
+// New Merkle Tree
+func NewMerkleTree() *MerkleTree {
+	return &MerkleTree{
+		Data: make(map[string]string),
 	}
 }
 
-func (vc *VectorClock) Copy() *VectorClock {
-	newVC := NewVectorClock()
-	for node, counter := range vc.clocks {
-		newVC.clocks[node] = counter
+// Insert data into the Merkle Tree
+func (mt *MerkleTree) Insert(key, value string) {
+	mt.mutex.Lock()
+	defer mt.mutex.Unlock()
+	mt.Data[key] = value
+	mt.build()
+}
+
+// Build the Merkle Tree
+func (mt *MerkleTree) build() {
+	var nodes []*MerkleTreeNode
+	for _, value := range mt.Data {
+		nodes = append(nodes, &MerkleTreeNode{Hash: hashString(value)})
 	}
-	return newVC
-}
-
-// Node in the Dynamo system
-type Node struct {
-	id   int
-	data map[string]*VersionedValue
-	mu   sync.RWMutex
-}
-
-// VersionedValue to store values with vector clocks
-type VersionedValue struct {
-	value string
-	clock *VectorClock
-}
-
-// Dynamo system
-type Dynamo struct {
-	nodes []*Node
-	ring  []int
-	mu    sync.RWMutex
-	N     int // Replication factor
-	R     int // Read quorum
-	W     int // Write quorum
-}
-
-// NewDynamo initializes a new Dynamo system
-func NewDynamo(nodeCount, replicationFactor, readQuorum, writeQuorum int) *Dynamo {
-	nodes := make([]*Node, nodeCount)
-	ring := make([]int, nodeCount)
-	for i := 0; i < nodeCount; i++ {
-		nodes[i] = &Node{id: i, data: make(map[string]*VersionedValue)}
-		ring[i] = i
-	}
-	return &Dynamo{nodes: nodes, ring: ring, N: replicationFactor, R: readQuorum, W: writeQuorum}
-}
-
-func (d *Dynamo) hash(key string) int {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return int(h.Sum32()) % len(d.nodes)
-}
-
-// Get retrieves the value for a given key
-func (d *Dynamo) Get(key string) (string, bool) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	nodeIdx := d.hash(key)
-	node := d.nodes[nodeIdx]
-
-	node.mu.RLock()
-	defer node.mu.RUnlock()
-
-	if version, exists := node.data[key]; exists {
-		return version.value, true
-	}
-
-	// Search replicas for the value
-	for i := 1; i < d.N; i++ {
-		replicaIdx := (nodeIdx + i) % len(d.nodes)
-		replica := d.nodes[replicaIdx]
-
-		replica.mu.RLock()
-		if version, exists := replica.data[key]; exists {
-			replica.mu.RUnlock()
-			return version.value, true
-		}
-		replica.mu.RUnlock()
-	}
-
-	return "", false
-}
-
-// Put stores a key-value pair
-func (d *Dynamo) Put(key string, value string, nodeID int) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	nodeIdx := d.hash(key)
-	node := d.nodes[nodeIdx]
-
-	node.mu.Lock()
-	defer node.mu.Unlock()
-
-	newClock := NewVectorClock()
-	newClock.Increment(nodeID)
-
-	if version, exists := node.data[key]; exists {
-		newClock.Merge(version.clock)
-	}
-	node.data[key] = &VersionedValue{value: value, clock: newClock}
-
-	// Replicate to other nodes
-	for i := 1; i < d.N; i++ {
-		replicaIdx := (nodeIdx + i) % len(d.nodes)
-		replica := d.nodes[replicaIdx]
-
-		replica.mu.Lock()
-		replica.data[key] = &VersionedValue{value: value, clock: newClock.Copy()}
-		replica.mu.Unlock()
-	}
-}
-
-// RandomFailure simulates a node failure
-func (d *Dynamo) RandomFailure() {
-	rand.Seed(time.Now().UnixNano())
-	idx := rand.Intn(len(d.nodes))
-	fmt.Printf("Node %d failed\n", idx)
-	d.nodes[idx] = &Node{id: idx, data: make(map[string]*VersionedValue)}
-}
-
-// Compare vector clocks to handle conflicts
-func compareVectorClocks(vc1, vc2 *VectorClock) int {
-	isGreater, isLess := false, false
-	for node, counter1 := range vc1.clocks {
-		counter2 := vc2.clocks[node]
-		if counter1 > counter2 {
-			isGreater = true
-		} else if counter1 < counter2 {
-			isLess = true
-		}
-	}
-	for node, counter2 := range vc2.clocks {
-		if _, exists := vc1.clocks[node]; !exists {
-			if counter2 > 0 {
-				isLess = true
+	for len(nodes) > 1 {
+		var newLevel []*MerkleTreeNode
+		for i := 0; i < len(nodes); i += 2 {
+			if i+1 == len(nodes) {
+				newLevel = append(newLevel, nodes[i])
+			} else {
+				combinedHash := hashString(nodes[i].Hash + nodes[i+1].Hash)
+				newNode := &MerkleTreeNode{
+					Hash:  combinedHash,
+					Left:  nodes[i],
+					Right: nodes[i+1],
+				}
+				newLevel = append(newLevel, newNode)
 			}
 		}
+		nodes = newLevel
 	}
-	if isGreater && isLess {
-		return 0 // Concurrent versions
-	} else if isGreater {
-		return 1
-	} else if isLess {
-		return -1
-	} else {
-		return 0 // Identical versions
+	if len(nodes) == 1 {
+		mt.Root = nodes[0]
 	}
 }
 
+// Compare two Merkle Trees
+func (mt *MerkleTree) Compare(other *MerkleTree) (bool, *MerkleTreeNode, *MerkleTreeNode) {
+	return compareNodes(mt.Root, other.Root)
+}
+
+// Compare Merkle Tree Nodes
+func compareNodes(a, b *MerkleTreeNode) (bool, *MerkleTreeNode, *MerkleTreeNode) {
+	if a == nil && b == nil {
+		return true, nil, nil
+	}
+	if a == nil || b == nil || a.Hash != b.Hash {
+		return false, a, b
+	}
+	leftEqual, leftA, leftB := compareNodes(a.Left, b.Left)
+	if !leftEqual {
+		return false, leftA, leftB
+	}
+	rightEqual, rightA, rightB := compareNodes(a.Right, b.Right)
+	if !rightEqual {
+		return false, rightA, rightB
+	}
+	return true, nil, nil
+}
+
+// Node structure representing a node in the Dynamo ring
+type Node struct {
+	ID        string
+	Data      map[string]Data
+	Available bool
+	Merkle    *MerkleTree
+	mutex     sync.Mutex
+}
+
+// NewNode creates a new node
+func NewNode(id string) *Node {
+	return &Node{
+		ID:        id,
+		Data:      make(map[string]Data),
+		Available: true,
+		Merkle:    NewMerkleTree(),
+	}
+}
+
+// Put inserts or updates a key-value pair in the node
+func (n *Node) Put(key, value string, vectorClock map[string]int) {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+	n.Data[key] = Data{Value: value, VectorClock: vectorClock}
+	n.Merkle.Insert(key, value)
+}
+
+// Get retrieves a key-value pair from the node
+func (n *Node) Get(key string) (Data, bool) {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+	data, exists := n.Data[key]
+	return data, exists
+}
+
+// Gossip simulates gossip protocol
+func (n *Node) Gossip(nodes map[string]*Node) {
+	if !n.Available {
+		return
+	}
+	for _, node := range nodes {
+		if node.ID != n.ID && node.Available {
+			n.mutex.Lock()
+			for key, data := range n.Data {
+				node.Put(key, data.Value, data.VectorClock)
+			}
+			n.mutex.Unlock()
+			fmt.Printf("Node %s gossiped state information to Node %s\n", n.ID, node.ID)
+		}
+	}
+}
+
+// CheckFailures simulates failure detection
+func (n *Node) CheckFailures(nodes map[string]*Node) {
+	if !n.Available {
+		fmt.Printf("Node %s is failed\n", n.ID)
+	} else {
+		fmt.Printf("Node %s is passed\n", n.ID)
+	}
+}
+
+// Dynamo structure representing the Dynamo system
+type Dynamo struct {
+	Nodes     map[string]*Node
+	N         int // Replication factor
+	R         int // Read quorum
+	W         int // Write quorum
+	hashFunc  hash.Hash
+	hashMutex sync.Mutex
+}
+
+// NewDynamo creates a new Dynamo system
+func NewDynamo(n, r, w int) *Dynamo {
+	return &Dynamo{
+		Nodes:    make(map[string]*Node),
+		N:        n,
+		R:        r,
+		W:        w,
+		hashFunc: sha1.New(),
+	}
+}
+
+// AddNode adds a new node to the Dynamo system
+func (d *Dynamo) AddNode(id string) {
+	d.Nodes[id] = NewNode(id)
+}
+
+// GetHash calculates the hash of a given key
+func (d *Dynamo) GetHash(key string) *big.Int {
+	d.hashMutex.Lock()
+	defer d.hashMutex.Unlock()
+	d.hashFunc.Reset()
+	d.hashFunc.Write([]byte(key))
+	hashBytes := d.hashFunc.Sum(nil)
+	return new(big.Int).SetBytes(hashBytes)
+}
+
+// GetNode returns the node responsible for a given key
+func (d *Dynamo) GetNode(key string) *Node {
+	hash := d.GetHash(key)
+	var closestNode *Node
+	var closestHash *big.Int
+	for _, node := range d.Nodes {
+		if !node.Available {
+			continue
+		}
+		nodeHash := d.GetHash(node.ID)
+		if closestNode == nil || nodeHash.Cmp(hash) > 0 && (closestHash == nil || nodeHash.Cmp(closestHash) < 0) {
+			closestNode = node
+			closestHash = nodeHash
+		}
+	}
+	return closestNode
+}
+
+// Put inserts or updates a key-value pair in the Dynamo system
+func (d *Dynamo) Put(key, value string) {
+	vectorClock := make(map[string]int)
+	for _, node := range d.Nodes {
+		if !node.Available {
+			continue
+		}
+		vectorClock[node.ID]++
+	}
+	node := d.GetNode(key)
+	if node != nil {
+		node.Put(key, value, vectorClock)
+	}
+}
+
+// Get retrieves a key-value pair from the Dynamo system
+func (d *Dynamo) Get(key string) (string, bool) {
+	node := d.GetNode(key)
+	if node == nil {
+		return "", false
+	}
+	data, exists := node.Get(key)
+	return data.Value, exists
+}
+
+// HandleNodeRecovery handles recovery of a node
+func (d *Dynamo) HandleNodeRecovery(nodeID string) {
+	// Logic to handle node recovery and data synchronization
+	fmt.Printf("Node %s recovered\n", nodeID)
+}
+
+// Main function
 func main() {
-	dynamo := NewDynamo(5, 3, 2, 2)
+	// Initialize Dynamo system
+	dynamo := NewDynamo(2, 2, 3)
+	dynamo.AddNode("Node1")
+	dynamo.AddNode("Node2")
+	dynamo.AddNode("Node3")
+	dynamo.AddNode("Node4")
+	dynamo.AddNode("Node5")
 
-	// Initial Put operation
-	dynamo.Put("key1", "value1", 0)
-	if val, ok := dynamo.Get("key1"); ok {
-		fmt.Println("Got:", val)
+	// Example put and get
+	dynamo.Put("my-key", "my-value")
+	value, found := dynamo.Get("my-key")
+	if found {
+		fmt.Printf("Key %s has value %s\n", "my-key", value)
 	} else {
 		fmt.Println("Key not found")
 	}
 
-	// Simulate node failure
-	dynamo.RandomFailure()
-
-	// Get operation after failure
-	if val, ok := dynamo.Get("key1"); ok {
-		fmt.Println("Got:", val)
+	// Example of node failure and recovery
+	dynamo.Nodes["Node2"].Available = false
+	dynamo.Put("another-key", "another-value")
+	dynamo.Nodes["Node2"].Available = true
+	dynamo.HandleNodeRecovery("Node2")
+	value, found = dynamo.Get("another-key")
+	if found {
+		fmt.Printf("Key %s has value %s\n", "another-key", value)
 	} else {
 		fmt.Println("Key not found")
 	}
 
-	// Additional operations to illustrate conflict resolution
-	dynamo.Put("key1", "value2", 1)
-	dynamo.Put("key1", "value3", 2)
+	// Gossip and failure detection example
+	for _, node := range dynamo.Nodes {
+		node.Gossip(dynamo.Nodes)
+	}
+	time.Sleep(1 * time.Second)
+	for _, node := range dynamo.Nodes {
+		node.CheckFailures(dynamo.Nodes)
+	}
 
-	if val, ok := dynamo.Get("key1"); ok {
-		fmt.Println("Got:", val)
+	// Example of Merkle tree comparison
+	node1 := dynamo.Nodes["Node1"]
+	node2 := dynamo.Nodes["Node2"]
+	equal, diffNode1, diffNode2 := node1.Merkle.Compare(node2.Merkle)
+	if !equal {
+		fmt.Printf("Merkle trees are different at nodes %v and %v\n", diffNode1, diffNode2)
 	} else {
-		fmt.Println("Key not found")
+		fmt.Println("Merkle trees are identical")
 	}
 }
